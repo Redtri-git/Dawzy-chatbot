@@ -6,7 +6,6 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from openai import OpenAI
-from anthropic import Anthropic 
 from dotenv import load_dotenv
 import json
 import os
@@ -20,11 +19,11 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
 
-        # openai_api_key = os.getenv("OPENAI_API_KEY")
-        openai_api_key = os.getenv('ANTHROPIC_API_KEY')
-        self.openai = Anthropic(api_key=openai_api_key,
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        # openai_api_key = os.getenv('DEEPINFRA_API_KEY')
+        self.openai = OpenAI(api_key=openai_api_key,
         # base_url="https://api.deepinfra.com/v1/openai"
-         # base_url = "https://api.openai.com/v1"
+         base_url = "https://api.openai.com/v1"
         )
 
     async def connect_to_server(self, server_script_path: str):
@@ -61,59 +60,66 @@ class MCPClient:
 
         response = await self.session.list_tools()
         available_tools = [{
-            "type": "custom",
-
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema
+            }
         } for tool in response.tools]
         # print(available_tools)
         # model_name = "Qwen/Qwen3-Coder-480B-A35B-Instruct"
         # model_name = "openai/gpt-oss-120b"
-        # model_name = 'gpt-5'
+        model_name = 'gpt-5'
         # model_name = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-        model_name = "claude-sonnet-4-5"
         # Initial OpenAI API call
-        response = self.openai.messages.create(
-            max_tokens=10000,
+        response = self.openai.chat.completions.create(
             model=model_name,
             messages=messages,
             tools=available_tools,
-            # tool_choice="auto",
+            tool_choice="auto",
         )
 
         # Process response and handle tool calls
         final_text = []
 
         while True:
-            reply = response
+            reply = response.choices[0].message
 
-            if reply.content:
-                for item in reply.content:
-                    if item.type == "text":
-                        final_text.append(item.text)
-                        messages.append({
-                            "role": "assistant",
-                            "content": item.text,
-                        })
-
-            tool_uses = [item for item in reply.content if item.type == "tool_use"]
-            if tool_uses:
-                # Add the assistant message that triggered the tool use(s)
+            if reply.content and not reply.tool_calls:
+                final_text.append(reply.content)
                 messages.append({
                     "role": "assistant",
-                    "content": reply.content,  # full message content (Claude expects structured content)
+                    "content": reply.content
                 })
 
-                for tool_use in tool_uses:
-                    tool_name = tool_use.name
-                    tool_input = tool_use.input
+            if reply.tool_calls:
+                # Add the assistant message that triggered the tool calls
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments
+                            }
+                        }
+                        for tool_call in reply.tool_calls
+                    ]
+                })
 
-                    # Execute the tool call
-                    result = await self.session.call_tool(tool_name, tool_input)
+                # print(len(reply.tool_calls))
+                # print(reply.tool_calls)
+                for tool_call in reply.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args = tool_call.function.arguments
+
+                    # Execute tool call
+                    parsed_args = json.loads(tool_args)
+                    result = await self.session.call_tool(tool_name, parsed_args)
                     # final_text.append(f"[Calling tool {tool_name} with args {parsed_args}]")
-
-                    # Convert tool result into plain text (if needed)
                     if isinstance(result.content, list):
                         tool_output_str = "\n".join(
                             item.text for item in result.content if getattr(item, "type", None) == "text"
@@ -121,33 +127,23 @@ class MCPClient:
                     else:
                         tool_output_str = str(result.content)
 
-                    # Add the tool result message (Claude expects role="user" + type="tool_result")
+                    # Add tool response message
                     messages.append({
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.id,
-                                "content": tool_output_str,
-                            }
-                        ],
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "content": tool_output_str,
                     })
 
-                # After sending tool results back, ask Claude for the next message
-                response = self.openai.messages.create(
-                    max_tokens=10000,
+                # Get next response from OpenAI
+                response = self.openai.chat.completions.create(
                     model=model_name,
                     messages=messages,
-                    tools=available_tools,
                 )
-                continue
-
-            if reply.stop_reason in ("end_turn", "max_tokens", None):
+            else:
                 break
 
-        # --- Stop when Claude is done ---
-        # return "\n".join(final_text)
-        return final_text[-1]
+        return "\n".join(final_text)
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
